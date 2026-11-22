@@ -24,6 +24,11 @@ QP_MAX = 51
 RATE_TOLERANCE_BITS = 1000.0
 
 
+def _clamp(value, low, high):
+    """把 value 钳制到 [low, high]。"""
+    return max(low, min(high, value))
+
+
 def frame_bits(complexity, qp, k, c):
     """按指数模型计算一帧编码后的比特数。
 
@@ -47,7 +52,15 @@ def frame_bits(complexity, qp, k, c):
         complexity <= 0、k <= 0、c < 0 或 qp 不在 0..51 时抛
         ``ValueError``。c=0 时 QP+6 恰好对应比特数除以 4。
     """
-    raise NotImplementedError
+    if complexity <= 0:
+        raise ValueError("complexity 必须为正数")
+    if k <= 0:
+        raise ValueError("k 必须为正数")
+    if c < 0:
+        raise ValueError("c 不能为负数")
+    if not QP_MIN <= qp <= QP_MAX:
+        raise ValueError("qp 必须在 0..51 范围内")
+    return complexity * k * 2.0 ** (-qp / 3.0) + c
 
 
 def vbv_level(buffer, bits, fps, max_rate):
@@ -73,7 +86,13 @@ def vbv_level(buffer, bits, fps, max_rate):
         大于缓冲区容量由上层的 :func:`validate_plan` 判定。
         帧率为 0、bits < 0 或 max_rate < 0 时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    if fps <= 0:
+        raise ValueError("fps 必须大于 0")
+    if bits < 0:
+        raise ValueError("bits 不能为负数")
+    if max_rate < 0:
+        raise ValueError("max_rate 不能为负数")
+    return buffer + bits - max_rate * 1000.0 / fps
 
 
 def qp_for_bits(target_bits, complexity, k, c):
@@ -100,7 +119,21 @@ def qp_for_bits(target_bits, complexity, k, c):
         结果是四舍五入而不是向上取整，也不是截断。
         complexity <= 0、k <= 0、c < 0 时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    if complexity <= 0:
+        raise ValueError("complexity 必须为正数")
+    if k <= 0:
+        raise ValueError("k 必须为正数")
+    if c < 0:
+        raise ValueError("c 不能为负数")
+    # 目标低于固定开销，指数项无解，使用最粗的量化。
+    if target_bits <= c:
+        return QP_MAX
+    # 保留 c 常数项的反解：先扣除固定开销再取对数。
+    qp = -3.0 * math.log2((target_bits - c) / (complexity * k))
+    # 四舍五入，小数部分恰为 0.5 时向上取整（不能用内置 round，
+    # 它是银行家舍入），再钳制到合法 QP 范围。
+    qp = int(math.floor(qp + 0.5))
+    return _clamp(qp, QP_MIN, QP_MAX)
 
 
 def plan_gop(frames, budget_bits, config):
@@ -133,7 +166,26 @@ def plan_gop(frames, budget_bits, config):
         作为每帧目标，否则高复杂度帧的码率会被压错。
         budget_bits <= 0 或 qp_min > qp_max 时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    if budget_bits <= 0:
+        raise ValueError("budget_bits 必须大于 0")
+    qp_min = config.get("qp_min", QP_MIN)
+    qp_max = config.get("qp_max", QP_MAX)
+    if qp_min > qp_max:
+        raise ValueError("qp_min 不能大于 qp_max")
+    if not frames:
+        return []
+    k = config["k"]
+    c = config["c"]
+    total_complexity = sum(frames)
+    qps = []
+    for complexity in frames:
+        if complexity <= 0:
+            raise ValueError("帧复杂度必须为正数")
+        # 按复杂度加权分配预算，而不是按帧数均分。
+        target_bits = budget_bits * complexity / total_complexity
+        qp = qp_for_bits(target_bits, complexity, k, c)
+        qps.append(_clamp(qp, qp_min, qp_max))
+    return qps
 
 
 def scene_bonus(complexities, ratio):
@@ -159,7 +211,19 @@ def scene_bonus(complexities, ratio):
         GOP 总预算放大。权重之和与帧数之差不超过 1e-9。
         ratio < 1 时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    if ratio < 1:
+        raise ValueError("ratio 必须 >= 1")
+    if not complexities:
+        return []
+    raw_weights = [1.0]
+    for i in range(1, len(complexities)):
+        if complexities[i] >= ratio * complexities[i - 1]:
+            raw_weights.append(float(ratio))
+        else:
+            raw_weights.append(1.0)
+    # 重新归一化到帧数：平均权重恒为 1，总预算不被放大。
+    scale = len(complexities) / sum(raw_weights)
+    return [weight * scale for weight in raw_weights]
 
 
 def smooth_qp(qps, max_step):
@@ -185,7 +249,17 @@ def smooth_qp(qps, max_step):
         ``max_step`` 按“每帧变化”解释，而不是按整段首尾 QP 差值。
         max_step < 0 时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    if max_step < 0:
+        raise ValueError("max_step 不能为负数")
+    if not qps:
+        return []
+    out = [_clamp(qps[0], QP_MIN, QP_MAX)]
+    for qp in qps[1:]:
+        # 逐帧限幅：相对上一帧（含跨 GOP 边界）的每帧变化受限。
+        previous = out[-1]
+        limited = _clamp(qp, previous - max_step, previous + max_step)
+        out.append(_clamp(limited, QP_MIN, QP_MAX))
+    return [int(qp) for qp in out]
 
 
 def validate_plan(qps, buffer_levels, budget):
@@ -216,7 +290,19 @@ def validate_plan(qps, buffer_levels, budget):
         （underflow）必须被发现。水位边界 0 与 ``buffer_size``
         本身合法。
     """
-    raise NotImplementedError
+    issues = []
+    buffer_size = budget["buffer_size"]
+    # 下溢与上溢都检查；边界 0 与 buffer_size 本身合法。
+    if any(level < 0 for level in buffer_levels):
+        issues.append("VBV underflow: 缓冲区水位小于 0")
+    if any(level > buffer_size for level in buffer_levels):
+        issues.append("VBV overflow: 缓冲区水位超过 buffer_size")
+    if abs(budget["actual_bits"] - budget["budget_bits"]) > RATE_TOLERANCE_BITS:
+        issues.append("budget overrun: 总比特超出预算 1 kbps 容差")
+    max_qp_step = budget.get("max_qp_step", QP_MAX)
+    if any(abs(curr - prev) > max_qp_step for prev, curr in zip(qps, qps[1:])):
+        issues.append("qp step: 相邻帧 QP 变化超过 max_qp_step")
+    return issues
 
 
 def control_batch(clips, config):
@@ -251,4 +337,66 @@ def control_batch(clips, config):
         必须与各自单独控制的结果完全相同（浮点值逐项相等）。
         任一 ``name`` 重复时抛 ``ValueError``。
     """
-    raise NotImplementedError
+    seen_names = set()
+    for clip in clips:
+        name = clip["name"]
+        if name in seen_names:
+            raise ValueError(f"clip 名称重复: {name}")
+        seen_names.add(name)
+
+    k = config["k"]
+    c = config["c"]
+    fps = config["fps"]
+    buffer_size = config["buffer_size"]
+    initial_buffer = config["initial_buffer"]
+    max_rate_kbps = config["max_rate_kbps"]
+    scene_ratio = config["scene_ratio"]
+    max_step = config["max_step"]
+
+    results = {}
+    for clip in clips:
+        name = clip["name"]
+        frames = list(clip["frames"])
+        budget_bits = clip["budget_bits"]
+
+        # 1. 场景切换权重（内部已归一化到帧数，不放大总预算）。
+        weights = scene_bonus(frames, scene_ratio)
+        # 2. 加权复杂度送入 GOP 规划，按复杂度分配预算。
+        weighted_frames = [
+            complexity * weight for complexity, weight in zip(frames, weights)
+        ]
+        planned = plan_gop(weighted_frames, budget_bits, config)
+        # 3. 逐帧 QP 限幅，跨 GOP 边界同样生效。
+        qps = smooth_qp(planned, max_step)
+
+        # 4. 每片独立的 VBV 状态：从 initial_buffer 重新开始，
+        #    实际比特用原始复杂度计算。
+        level = initial_buffer
+        levels = []
+        total_bits = 0.0
+        for complexity, qp in zip(frames, qps):
+            bits = frame_bits(complexity, qp, k, c)
+            total_bits += bits
+            level = vbv_level(level, bits, fps, max_rate_kbps)
+            levels.append(level)
+
+        # 5. 上下溢、总预算误差与 QP 阶跃一并校验。
+        issues = validate_plan(
+            qps,
+            levels,
+            {
+                "buffer_size": buffer_size,
+                "budget_bits": budget_bits,
+                "actual_bits": total_bits,
+                "max_qp_step": max_step,
+            },
+        )
+
+        results[name] = {
+            "qps": qps,
+            "levels": levels,
+            "total_bits": total_bits,
+            "final_level": levels[-1] if levels else initial_buffer,
+            "issues": issues,
+        }
+    return results
